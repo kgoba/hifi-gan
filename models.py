@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
 from utils import init_weights, get_padding
+import torchaudio
 
 LRELU_SLOPE = 0.1
 
@@ -78,7 +79,7 @@ class Generator(torch.nn.Module):
         self.h = h
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = weight_norm(Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3))
+        self.conv_pre = weight_norm(Conv1d(h.num_mels, h.upsample_initial_channel, 7, 1, padding=3))
         resblock = ResBlock1 if h.resblock == '1' else ResBlock2
 
         self.ups = nn.ModuleList()
@@ -156,7 +157,7 @@ class DiscriminatorP(torch.nn.Module):
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
-        x = torch.flatten(x, 1, -1)
+        x = torch.sigmoid(torch.flatten(x, 1, -1))
 
         return x, fmap
 
@@ -211,7 +212,7 @@ class DiscriminatorS(torch.nn.Module):
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
-        x = torch.flatten(x, 1, -1)
+        x = torch.sigmoid(torch.flatten(x, 1, -1))
 
         return x, fmap
 
@@ -224,10 +225,21 @@ class MultiScaleDiscriminator(torch.nn.Module):
             DiscriminatorS(),
             DiscriminatorS(),
         ])
-        self.meanpools = nn.ModuleList([
-            AvgPool1d(4, 2, padding=2),
-            AvgPool1d(4, 2, padding=2)
-        ])
+
+        # self.resampler = torchaudio.transforms.Resample(
+        self.resampler = lambda x: torchaudio.functional.resample(x,
+            2,
+            1,
+            lowpass_filter_width=16,
+            rolloff=0.85,
+            resampling_method="sinc_interp_kaiser",
+            beta=8.5555,
+        )
+
+        # self.meanpools = nn.ModuleList([
+        #     AvgPool1d(4, 2, padding=2),
+        #     AvgPool1d(4, 2, padding=2)
+        # ])
 
     def forward(self, y, y_hat):
         y_d_rs = []
@@ -236,8 +248,8 @@ class MultiScaleDiscriminator(torch.nn.Module):
         fmap_gs = []
         for i, d in enumerate(self.discriminators):
             if i != 0:
-                y = self.meanpools[i-1](y)
-                y_hat = self.meanpools[i-1](y_hat)
+                y = self.resampler(y)
+                y_hat = self.resampler(y_hat)
             y_d_r, fmap_r = d(y)
             y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
@@ -250,34 +262,27 @@ class MultiScaleDiscriminator(torch.nn.Module):
 
 def feature_loss(fmap_r, fmap_g):
     loss = 0
+    count = 0
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
             loss += torch.mean(torch.abs(rl - gl))
+            count += 1
 
-    return loss*2
+    return loss / count
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
-    r_losses = []
-    g_losses = []
     for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1-dr)**2)
-        g_loss = torch.mean(dg**2)
-        loss += (r_loss + g_loss)
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
+        loss += torch.mean((1-dr)**2 + dg**2)
 
-    return loss, r_losses, g_losses
+    return loss / len(disc_real_outputs)
 
 
 def generator_loss(disc_outputs):
     loss = 0
-    gen_losses = []
     for dg in disc_outputs:
-        l = torch.mean((1-dg)**2)
-        gen_losses.append(l)
-        loss += l
+        loss += torch.mean((1-dg)**2)
 
-    return loss, gen_losses
+    return loss / len(disc_outputs)
 

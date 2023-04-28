@@ -31,6 +31,10 @@ def apply_weight_norm(m):
         weight_norm(m)
 
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size*dilation - dilation)/2)
 
