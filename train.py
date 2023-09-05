@@ -62,7 +62,7 @@ def train_step(models, optimizers, batch, h):
     optim_d.zero_grad()
     loss_disc_all.backward()
     optim_d.step()
-    
+
     return {
         "gen_all": loss_gen_all.item(),
         "gen": loss_gen.item(),
@@ -191,7 +191,7 @@ def train(rank, a, h, device):
                     save_checkpoint(checkpoint_path,
                                     {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
                     checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path, 
+                    save_checkpoint(checkpoint_path,
                                     {'mpd': (mpd.module if h.num_gpus > 1
                                                          else mpd).state_dict(),
                                      'msd': (msd.module if h.num_gpus > 1
@@ -202,10 +202,10 @@ def train(rank, a, h, device):
                 # Tensorboard summary logging
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss["gen_all"], steps)
-                    sw.add_scalars("training/mel_spec_error", 
+                    sw.add_scalars("training/mel_spec_error",
                                     {
                                         "mel_avg": loss_mel_avg,
-                                        "gen": loss["gen"], 
+                                        "gen": loss["gen"],
                                         "dis": loss["disc_all"]
                                     }, steps)
 
@@ -245,7 +245,7 @@ def train(rank, a, h, device):
 
         scheduler_g.step()
         scheduler_d.step()
-        
+
 
 def main():
     print('Initializing Training Process..')

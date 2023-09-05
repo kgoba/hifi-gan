@@ -6,6 +6,7 @@ import argparse
 import json
 import torch
 from scipy.io.wavfile import write
+import numpy as np
 from env import AttrDict
 from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
 from models import Generator
@@ -40,7 +41,7 @@ def inference(a):
     state_dict_g = load_checkpoint(a.checkpoint_file, device)
     generator.load_state_dict(state_dict_g['generator'])
 
-    filelist = os.listdir(a.input_wavs_dir)
+    filelist = os.listdir(a.input_dir)
 
     os.makedirs(a.output_dir, exist_ok=True)
 
@@ -48,10 +49,14 @@ def inference(a):
     generator.remove_weight_norm()
     with torch.no_grad():
         for i, filname in enumerate(filelist):
-            wav, sr = load_wav(os.path.join(a.input_wavs_dir, filname))
-            wav = wav / MAX_WAV_VALUE
-            wav = torch.FloatTensor(wav).to(device)
-            x = get_mel(wav.unsqueeze(0))
+            if a.from_mels:
+                x = np.load(os.path.join(a.input_dir, filname))
+                x = torch.FloatTensor(x).to(device)
+            else:
+                wav, sr = load_wav(os.path.join(a.input_dir, filname))
+                wav = wav / MAX_WAV_VALUE
+                wav = torch.FloatTensor(wav).to(device)
+                x = get_mel(wav.unsqueeze(0))
             y_g_hat = generator(x)
             audio = y_g_hat.squeeze()
             audio = audio * MAX_WAV_VALUE
@@ -66,9 +71,10 @@ def main():
     print('Initializing Inference Process..')
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_wavs_dir', default='test_files')
+    parser.add_argument('--input_dir', default='test_files')
     parser.add_argument('--output_dir', default='generated_files')
     parser.add_argument('--checkpoint_file', required=True)
+    parser.add_argument('--from_mels', action="store_true")
     a = parser.parse_args()
 
     config_file = os.path.join(os.path.split(a.checkpoint_file)[0], 'config.json')
