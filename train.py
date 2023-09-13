@@ -2,22 +2,19 @@ import warnings
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 import itertools
-import os, sys
-import time
+import os, sys, glob
 import argparse
 import json
-import glob
+import random
 from tqdm.auto import tqdm
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DistributedSampler, DataLoader
-import torch.multiprocessing as mp
-from torch.distributed import init_process_group
-from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader
 from env import AttrDict, build_env
-from hifigan.meldataset import MelDataset, get_dataset_filelist
+from hifigan.meldataset import MelDataset
 from hifigan.models import Generator, feature_loss, generator_loss, discriminator_loss
 from hifigan.discriminator import MultiPeriodDiscriminator, MultiScaleDiscriminator
 from hifigan.utils import (
@@ -29,72 +26,147 @@ from hifigan.utils import (
 )
 from hifigan.audio import AudioFrontendConfig, AudioFrontend
 
-torch.backends.cudnn.benchmark = True
+# import torchmetrics
+import pytorch_lightning as pl
 
 
-def train_step(models, optimizers, batch, audio_frontend):
-    generator, msd, mpd = models
-    optim_g, optim_d = optimizers
-    x, y, y_mel = batch
+class TrainerTask(pl.LightningModule):
+    def __init__(
+        self,
+        generator,
+        discriminators,
+        audio_frontend,
+        lr=0.0002,
+        beta1=0.8,
+        beta2=0.99,
+        sample_rate=22050,
+    ):
+        super().__init__()
+        self.G = generator
+        self.D_list = discriminators
+        self.audio_frontend = audio_frontend
+        # self.save_hyperparameters(ignore=["generator", "discriminators", "audio_frontend"])
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.sample_rate = sample_rate
 
-    y = y.unsqueeze(1)
+        # Important: This property activates manual optimization.
+        self.automatic_optimization = False
 
-    # Generator
-    mpd.requires_grad_(False)
-    msd.requires_grad_(False)
+    def training_step(self, batch, batch_idx):
+        g_opt, d_opt = self.optimizers()
 
-    y_g_hat = generator(x)
-    _, y_g_hat_mel = audio_frontend.encode(y_g_hat.squeeze(1).cpu())
-    y_g_hat_mel = y_g_hat_mel.to(y_g_hat.device)
+        x, y, _, y_mel = batch
+        y = y.unsqueeze(1)
 
-    _, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-    _, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-    loss_gen = generator_loss(y_df_hat_g) + generator_loss(y_ds_hat_g)
-    loss_fm = feature_loss(fmap_f_r, fmap_f_g) + feature_loss(fmap_s_r, fmap_s_g)
-    loss_mel = F.l1_loss(y_mel, y_g_hat_mel)
-    loss_gen_all = 1.0 * loss_gen + 2.0 * loss_fm + 45 * loss_mel
+        # Generate
+        y_g_hat = self.G(x)
 
-    optim_g.zero_grad()
-    loss_gen_all.backward()
-    optim_g.step()
+        # Optimize Discriminator
+        self.G.requires_grad_(False)
+        self.D_list.requires_grad_(True)
+        loss_disc = 0
+        for D in self.D_list:
+            y_d_hat_r, _ = D(y)
+            y_d_hat_g, _ = D(y_g_hat.detach())
+            loss_disc += discriminator_loss(y_d_hat_r, y_d_hat_g)
 
-    # Discriminator
-    mpd.requires_grad_(True)
-    msd.requires_grad_(True)
+        d_opt.zero_grad()
+        self.manual_backward(loss_disc)
+        d_opt.step()
 
-    y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-    y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-    loss_disc_f = discriminator_loss(y_df_hat_r, y_df_hat_g)
-    loss_disc_s = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
-    loss_disc_all = loss_disc_s + loss_disc_f
+        # Optimize Generator
+        self.G.requires_grad_(True)
+        self.D_list.requires_grad_(False)
+        _, y_g_hat_mel = self.audio_frontend.encode(y_g_hat.squeeze(1).cpu())
+        loss_mel = F.l1_loss(y_mel, y_g_hat_mel.to(y_mel.device))
+        loss_gen_all = 45 * loss_mel
 
-    optim_d.zero_grad()
-    loss_disc_all.backward()
-    optim_d.step()
+        loss_gen, loss_fm = 0, 0
+        for D in self.D_list:
+            _, fmap_r = D(y)
+            y_d_hat_g, fmap_g = D(y_g_hat)
+            loss_gen += generator_loss(y_d_hat_g)
+            loss_fm += feature_loss(fmap_r, fmap_g)
 
-    return {
-        "gen_all": loss_gen_all.item(),
-        "gen": loss_gen.item(),
-        "fm": loss_fm.item(),
-        "mel": loss_mel.item(),
-        "disc_all": loss_disc_all.item(),
-    }
+        loss_gen_all += loss_gen + 2 * loss_fm
+
+        g_opt.zero_grad()
+        self.manual_backward(loss_gen_all)
+        g_opt.step()
+
+        self.log_dict(
+            {
+                "L_d": loss_disc,
+                "L_g": loss_gen,
+                "L_fm": loss_fm,
+                "L_g_all": loss_gen_all,
+                "L_mel": loss_mel,
+            },
+            prog_bar=True,
+        )
+
+    def validation_step(self, batch, batch_idx):
+        x, y, _, y_mel = batch
+        y = y.unsqueeze(1)
+
+        # Generate
+        y_g_hat = self.G(x)
+
+        _, y_g_hat_mel = self.audio_frontend.encode(y_g_hat.squeeze(1).cpu())
+        val_loss = F.l1_loss(y_mel.cpu(), y_g_hat_mel)
+
+        x, y, y_mel, y_g_hat_mel = x.cpu(), y.cpu(), y_mel.cpu(), y_g_hat_mel.cpu()
+
+        if batch_idx < 5:
+            # Get tensorboard logger
+            tb_logger = None
+            for logger in self.loggers:
+                if isinstance(logger, pl.loggers.TensorBoardLogger):
+                    tb_logger = logger.experiment
+                    break
+
+            if tb_logger != None:
+                # tb_logger.add_audio(f"gt/y_{batch_idx}", y[0], self.global_step, self.sample_rate)
+                # tb_logger.add_figure(
+                #     f"gt/y_spec_{batch_idx}", plot_spectrogram(x[0]), self.global_step
+                # )
+                tb_logger.add_audio(
+                    f"generated/y_hat_{batch_idx}",
+                    y_g_hat[0],
+                    self.global_step,
+                    self.sample_rate,
+                )
+                tb_logger.add_figure(
+                    f"generated/y_hat_spec_{batch_idx}",
+                    plot_spectrogram(y_g_hat_mel[0]),
+                    self.global_step,
+                )
+
+        self.log("L_val", val_loss, batch_size=1)
+
+    def configure_optimizers(self):
+        g_opt = torch.optim.AdamW(self.G.parameters(), lr=self.lr, betas=(self.beta1, self.beta2))
+        d_opt = torch.optim.AdamW(
+            self.D_list.parameters(),
+            lr=self.lr,
+            betas=(self.beta1, self.beta2),
+        )
+        # Return:
+        # * List or Tuple of optimizers.
+        # * Two lists - The first list has multiple optimizers, and the second has multiple LR schedulers (or multiple lr_scheduler_config).
+        return g_opt, d_opt
 
 
-def train(a, h, device):
-    generator = Generator(h).to(device)
-    mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
-
-    print(generator)
-    print(f"Generator parameters: {count_parameters(generator)}")
-    print(f"Discriminator parameters: {count_parameters(mpd) + count_parameters(msd)}")
-    os.makedirs(a.checkpoint_path, exist_ok=True)
-    print("Checkpoints directory: ", a.checkpoint_path)
+def load_legacy_checkpoint(a, generator, mpd, msd, device):
+    # os.makedirs(a.checkpoint_path, exist_ok=True)
+    # print("Checkpoints directory: ", a.checkpoint_path)
 
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, "g_")
         cp_do = scan_checkpoint(a.checkpoint_path, "do_")
+        # cp_do = os.path.join(a.checkpoint_path, "do_current")
 
     steps = 0
     if cp_g is None or cp_do is None:
@@ -109,28 +181,12 @@ def train(a, h, device):
         steps = state_dict_do["steps"] + 1
         last_epoch = state_dict_do["epoch"]
 
-    optim_g = torch.optim.AdamW(
-        generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2]
-    )
-    optim_d = torch.optim.AdamW(
-        itertools.chain(msd.parameters(), mpd.parameters()),
-        h.learning_rate,
-        betas=[h.adam_b1, h.adam_b2],
-    )
 
-    if state_dict_do is not None:
-        optim_g.load_state_dict(state_dict_do["optim_g"])
-        optim_d.load_state_dict(state_dict_do["optim_d"])
-
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=h.lr_decay, last_epoch=last_epoch
-    )
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=h.lr_decay, last_epoch=last_epoch
-    )
-
-    # training_filelist, validation_filelist = get_dataset_filelist(a)
-    audio_filelist = glob.glob("*.wav", root_dir=a.input_wavs_dir)
+def train(a, h, device):
+    generator = Generator(h)
+    mpd = MultiPeriodDiscriminator()
+    msd = MultiScaleDiscriminator()
+    discriminators = nn.ModuleList([mpd, msd])
 
     audio_config = AudioFrontendConfig()
     audio_config.sample_rate = h.sampling_rate
@@ -141,15 +197,16 @@ def train(a, h, device):
     audio_config.fmax = h.fmax
     audio_frontend = AudioFrontend(audio_config)
 
-    dataset = MelDataset(audio_filelist, a.input_wavs_dir, h.segment_size, audio_frontend)
-
-    trainset, validset = torch.utils.data.random_split(
-        dataset, [len(dataset) - 100, 100], generator=torch.Generator().manual_seed(42)
-    )
+    # training_filelist, validation_filelist = get_dataset_filelist(a)
+    audio_filelist = sorted(glob.glob("*.wav", root_dir=a.input_wavs_dir))
+    random.seed(42)
+    random.shuffle(audio_filelist)
+    train_filelist = audio_filelist[25:]
+    test_filelist = audio_filelist[:25]
 
     train_loader = DataLoader(
-        trainset,
-        # num_workers=h.num_workers,
+        MelDataset(train_filelist, a.input_wavs_dir, h.segment_size, audio_frontend),
+        num_workers=4,  # h.num_workers,
         shuffle=True,
         batch_size=h.batch_size,
         pin_memory=True,
@@ -157,119 +214,49 @@ def train(a, h, device):
     )
 
     validation_loader = DataLoader(
-        validset,
-        # num_workers=1,
+        MelDataset(test_filelist, a.input_wavs_dir, None, audio_frontend),
+        num_workers=4,
         shuffle=False,
         batch_size=1,
         pin_memory=True,
         drop_last=True,
     )
 
-    sw = SummaryWriter(os.path.join(a.checkpoint_path, "logs"))
+    load_legacy_checkpoint(a, generator, mpd, msd, device)
 
-    generator.train()
-    mpd.train()
-    msd.train()
-    loss_mel_hist = []
-    for epoch in range(max(0, last_epoch), a.training_epochs):
-        print("Epoch: {}".format(epoch + 1))
+    logger = pl.loggers.tensorboard.TensorBoardLogger(save_dir='lightning_logs', version=0)
 
-        pbar_epoch = tqdm(train_loader, total=len(trainset) // h.batch_size)
-        for batch in pbar_epoch:
-            pbar_epoch.set_description(f"Step {steps}")
-            x, y, _, y_mel = batch
-            x = torch.autograd.Variable(x.to(device, non_blocking=True))
-            y = torch.autograd.Variable(y.to(device, non_blocking=True))
-            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath="checkpoints",
+        # filename="cp-last",
+        save_last=True,
+        # every_n_train_steps=10,
+        every_n_epochs=1,
+    )
+    trainer = pl.Trainer(
+        logger=logger,
+        # callbacks=[pl.callbacks.OnExceptionCheckpoint("."), checkpoint_callback],
+        callbacks=[checkpoint_callback],
+        # callbacks=[
+        #     pl.callbacks.LambdaCallback(
+        #         on_train_epoch_end=lambda *args: trainer.save_checkpoint("last.ckpt")
+        #     )
+        # ],
+        accelerator="auto",
+        # enable_checkpointing=True,
+        limit_train_batches=100,
+        # limit_val_batches=10,
+    )
 
-            loss = train_step([generator, mpd, msd], [optim_g, optim_d], [x, y, y_mel], audio_frontend)
+    trainer_task = TrainerTask(generator, discriminators, audio_frontend, lr=h.learning_rate)
 
-            # STDOUT logging
-            # if steps % a.stdout_interval == 0:
-            # with torch.no_grad():
-            # mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
-
-            loss_mel_hist = [loss["mel"]] + loss_mel_hist[:49]
-            loss_mel_avg = np.mean(loss_mel_hist)
-
-            pbar_epoch.set_postfix_str(
-                f'L_d: {loss["disc_all"]:.2f}, L_g: {loss["gen"]:.2f}, L_f: {loss["fm"]:.2f}, L_mel: {loss_mel_avg:.3f}, L: {loss["gen_all"]:.2f}'
-            )
-
-            # checkpointing
-            if steps % a.checkpoint_interval == 0 and steps != 0:
-                checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
-                save_checkpoint(
-                    checkpoint_path,
-                    {
-                        "generator": generator.state_dict()
-                    },
-                )
-                checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                save_checkpoint(
-                    checkpoint_path,
-                    {
-                        "mpd": mpd.state_dict(),
-                        "msd": msd.state_dict(),
-                        "optim_g": optim_g.state_dict(),
-                        "optim_d": optim_d.state_dict(),
-                        "steps": steps,
-                        "epoch": epoch,
-                    },
-                )
-
-            # Tensorboard summary logging
-            if steps % a.summary_interval == 0:
-                sw.add_scalar("training/gen_loss_total", loss["gen_all"], steps)
-                sw.add_scalars(
-                    "training/mel_spec_error",
-                    {"mel_avg": loss_mel_avg, "gen": loss["gen"], "dis": loss["disc_all"]},
-                    steps,
-                )
-
-            # Validation
-            if steps % a.validation_interval == 0 and steps != 0:
-                generator.eval()
-                torch.cuda.empty_cache()
-                val_err_tot = 0
-                with torch.no_grad():
-                    for j, batch in enumerate(validation_loader):
-                        x, y, _, y_mel = batch
-                        y_g_hat = generator(x.to(device))
-                        y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
-                        _, y_g_hat_mel = audio_frontend.encode(y_g_hat.squeeze(1).cpu())
-                        y_g_hat_mel = y_g_hat_mel.to(y_g_hat.device)
-                        val_err_tot += F.l1_loss(y_mel, y_g_hat_mel).item()
-
-                        if j <= 4:
-                            if steps == 0:
-                                sw.add_audio("gt/y_{}".format(j), y[0], steps, h.sampling_rate)
-                                sw.add_figure(
-                                    "gt/y_spec_{}".format(j), plot_spectrogram(x[0]), steps
-                                )
-
-                            sw.add_audio(
-                                "generated/y_hat_{}".format(j),
-                                y_g_hat[0],
-                                steps,
-                                h.sampling_rate,
-                            )
-
-                            sw.add_figure(
-                                "generated/y_hat_spec_{}".format(j),
-                                plot_spectrogram(y_g_hat_mel.squeeze(0).cpu().numpy()),
-                                steps,
-                            )
-
-                    val_err = val_err_tot / (j + 1)
-                    sw.add_scalar("validation/mel_spec_error", val_err, steps)
-
-                generator.train()
-
-            steps += 1
-
-        scheduler_g.step()
-        scheduler_d.step()
+    trainer.fit(
+        model=trainer_task,
+        train_dataloaders=train_loader,
+        val_dataloaders=validation_loader,
+        # ckpt_path="checkpoints/cp-last-v5.ckpt",
+        ckpt_path="last"
+    )
 
 
 def main():
@@ -277,13 +264,12 @@ def main():
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--group_name", default=None)
+    parser.add_argument("--config", default="")
     parser.add_argument("--input_wavs_dir", default="LJSpeech-1.1/wavs")
     parser.add_argument("--input_mels_dir", default="ft_dataset")
     parser.add_argument("--input_training_file", default="LJSpeech-1.1/training.txt")
     parser.add_argument("--input_validation_file", default="LJSpeech-1.1/validation.txt")
     parser.add_argument("--checkpoint_path", default="cp_hifigan")
-    parser.add_argument("--config", default="")
     parser.add_argument("--training_epochs", default=3100, type=int)
     parser.add_argument("--stdout_interval", default=5, type=int)
     parser.add_argument("--checkpoint_interval", default=5000, type=int)

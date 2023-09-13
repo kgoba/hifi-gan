@@ -3,9 +3,7 @@ import os
 import random
 import torch
 import torch.utils.data
-import torchaudio
 import numpy as np
-from hifigan.audio import AudioFrontend, AudioFrontendConfig
 
 MAX_WAV_VALUE = 32768.0
 
@@ -56,7 +54,6 @@ class MelDataset(torch.utils.data.Dataset):
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
         self.hop_length = audio_frontend.config.hop_length
-        self.extra_samples = 0 # audio_frontend.config.win_length - audio_frontend.config.hop_length
 
     def __getitem__(self, index):
         filename = os.path.join(self.audio_dir, self.audio_files[index])
@@ -64,23 +61,25 @@ class MelDataset(torch.utils.data.Dataset):
 
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0)  # mix multichannel to mono
-        else:
-            audio = audio.squeeze(dim=0)
-
+            audio = audio.unsqueeze(0)
 
         if not self.fine_tuning:
             if self.segment_size:
-                max_audio_start = audio.size(0)
+                max_audio_start = audio.size(1)
                 mel_start = random.randint(0, max_audio_start) // self.hop_length
                 audio_start = mel_start * self.hop_length
 
-                audio = torch.nn.functional.pad(audio, (0, self.segment_size + self.extra_samples), 'constant')
-                audio = audio[audio_start:audio_start + self.segment_size + self.extra_samples]
+                if audio_start + self.segment_size > audio.size(1):
+                    audio = torch.nn.functional.pad(audio, (0, self.segment_size), 'constant')
+
+                audio = audio[:, audio_start:audio_start + self.segment_size]
 
             _, mel = self.audio_frontend.encode(audio)
 
             if self.segment_size:
-                audio = audio[:self.segment_size]
+                audio = audio[:, :self.segment_size]
+
+            audio = audio.squeeze(0)
         else:
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))

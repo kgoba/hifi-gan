@@ -56,20 +56,15 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             DiscriminatorP(11),
         ])
 
-    def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
-        fmap_rs = []
-        fmap_gs = []
+    def forward(self, y):
+        y_d_list = []
+        fmap_list = []
         for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            fmap_rs.append(fmap_r)
-            y_d_gs.append(y_d_g)
-            fmap_gs.append(fmap_g)
+            y_d, fmap = d(y)
+            y_d_list.append(y_d)
+            fmap_list.append(fmap)
 
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+        return y_d_list, fmap_list
 
 
 class DiscriminatorS(torch.nn.Module):
@@ -124,20 +119,14 @@ class MultiScaleDiscriminator(torch.nn.Module):
         #     AvgPool1d(4, 2, padding=2)
         # ])
 
-    def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
-        fmap_rs = []
-        fmap_gs = []
+    def forward(self, y):
+        y_d_list = []
+        fmap_list = []
         for i, d in enumerate(self.discriminators):
             if i != 0:
                 y = self.resampler(y)
-                y_hat = self.resampler(y_hat)
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            fmap_rs.append(fmap_r)
-            y_d_gs.append(y_d_g)
-            fmap_gs.append(fmap_g)
+            y_d, fmap = d(y)
+            y_d_list.append(y_d)
+            fmap_list.append(fmap)
 
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+        return y_d_list, fmap_list
