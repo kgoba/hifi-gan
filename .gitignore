@@ -1,1 +1,7 @@
+.vscode/
+cp_*/
+RDH_VL/
+misc/
+checkpoints*/
+lightning_logs*/
 __pycache__/

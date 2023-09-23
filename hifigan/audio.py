@@ -23,14 +23,14 @@ class AudioFrontend:
         self.n_fft = config.win_length
         self.hop_length = config.hop_length
         n_stft = (self.n_fft // 2) + 1
-        # self.stft_to_mels = MelScale(
-        #     n_mels=self.config.num_mels,
-        #     sample_rate=self.config.sample_rate,
-        #     n_stft=n_stft,
-        #     f_min=self.config.fmin,
-        #     f_max=self.config.fmax,
-        #     norm="slaney",
-        # )
+        self.stft_to_mels_db = MelScale(
+            n_mels=self.config.num_mels,
+            sample_rate=self.config.sample_rate,
+            n_stft=n_stft,
+            f_min=self.config.fmin,
+            f_max=self.config.fmax,
+            norm="slaney",
+        )
         self.stft_to_mels = MelScale(
             n_mels=self.config.num_mels,
             sample_rate=self.config.sample_rate,
@@ -40,9 +40,9 @@ class AudioFrontend:
             norm="slaney",
             mel_scale="slaney"
         )
-        # self.spectrogram = Spectrogram(
-        #     n_fft=self.n_fft, hop_length=self.hop_length, power=2, normalized=True, center=True
-        # )
+        self.spectrogram_db = Spectrogram(
+            n_fft=self.n_fft, hop_length=self.hop_length, power=2, normalized=True, center=True
+        )
         self.spectrogram = Spectrogram(
             n_fft=self.n_fft, hop_length=self.hop_length, power=1, normalized=False, center=False
         )
@@ -71,23 +71,28 @@ class AudioFrontend:
         D = self.spectrogram(wave)
         M = self.stft_to_mels(D)
 
-        D_db = torch.log(D.clip(min=1e-5))
-        M_db = torch.log(M.clip(min=1e-5))
-        # print(M_db.min(), M_db.max())
-        return D_db, M_db
+        D_log = torch.log(D.clip(min=1e-5))
+        M_log = torch.log(M.clip(min=1e-5))
+        return D_log, M_log
 
     def encode_db(self, wave):
         half_hop = self.hop_length // 2
         wave[:, :half_hop] *= self.window[:half_hop]
         wave[:, -half_hop:] *= self.window[half_hop:]
 
+        # wave = torch.nn.functional.pad(wave, (self.n_fft//2, self.hop_length), 'constant')
         wave = torch.nn.functional.pad(wave, (half_hop, half_hop), 'constant')
-        D = self.spectrogram(wave) [:, :, 1:-1]
-        M = self.stft_to_mels(D)
+        D = self.spectrogram_db(wave) [:, :, 1:-1]
+        M = self.stft_to_mels_db(D)
 
         D_db = (amplitude_to_DB(D, 10, 1e-12, 0) + 120) / 120
         M_db = (amplitude_to_DB(M, 10, 1e-12, 0) + 120) / 120
-        return D_db, M_db
+
+        D_log = (D_db - 0.911) / 0.0724
+        M_log = (M_db - 0.911) / 0.0724
+        return D_log, M_log
 
     def encode(self, wave):
-        return self.encode_log(wave)
+        # D, M = self.encode_log(wave)
+        D_log, M_log = self.encode_db(wave)
+        return D_log, M_log

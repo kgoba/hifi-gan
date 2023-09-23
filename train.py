@@ -81,7 +81,7 @@ class TrainerTask(pl.LightningModule):
         self.D_list.requires_grad_(False)
         _, y_g_hat_mel = self.audio_frontend.encode(y_g_hat.squeeze(1).cpu())
         loss_mel = F.l1_loss(y_mel, y_g_hat_mel.to(y_mel.device))
-        loss_gen_all = 45 * loss_mel
+        loss_gen_all = 15 * loss_mel
 
         loss_gen, loss_fm = 0, 0
         for D in self.D_list:
@@ -167,6 +167,7 @@ def load_legacy_checkpoint(a, generator, mpd, msd, device):
         cp_g = scan_checkpoint(a.checkpoint_path, "g_")
         cp_do = scan_checkpoint(a.checkpoint_path, "do_")
         # cp_do = os.path.join(a.checkpoint_path, "do_current")
+        print(f"Found checkpoints {cp_g} and {cp_do}")
 
     steps = 0
     if cp_g is None or cp_do is None:
@@ -182,11 +183,24 @@ def load_legacy_checkpoint(a, generator, mpd, msd, device):
         last_epoch = state_dict_do["epoch"]
 
 
+def save_scripted_generator(generator, path="generator_traced.pt"):
+    x_sample = torch.zeros((1, 80, 32))
+    trace = torch.jit.trace(generator, x_sample)
+    # generator.remove_weight_norm()
+    # script = torch.jit.script(generator)
+    x_test = torch.zeros((1, 80, 64))
+    trace(x_test)
+    print(f"Saving scripted generator to {path}")
+    trace.save(path)
+
+
 def train(a, h, device):
     generator = Generator(h)
     mpd = MultiPeriodDiscriminator()
     msd = MultiScaleDiscriminator()
     discriminators = nn.ModuleList([mpd, msd])
+
+    load_legacy_checkpoint(a, generator, mpd, msd, device)
 
     audio_config = AudioFrontendConfig()
     audio_config.sample_rate = h.sampling_rate
@@ -222,12 +236,10 @@ def train(a, h, device):
         drop_last=True,
     )
 
-    load_legacy_checkpoint(a, generator, mpd, msd, device)
-
-    logger = pl.loggers.tensorboard.TensorBoardLogger(save_dir='lightning_logs', version=0)
+    logger = pl.loggers.tensorboard.TensorBoardLogger(save_dir="lightning_logs", version=0)
 
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath="checkpoints",
+        dirpath=a.checkpoint_path,
         # filename="cp-last",
         save_last=True,
         # every_n_train_steps=10,
@@ -236,7 +248,14 @@ def train(a, h, device):
     trainer = pl.Trainer(
         logger=logger,
         # callbacks=[pl.callbacks.OnExceptionCheckpoint("."), checkpoint_callback],
-        callbacks=[checkpoint_callback],
+        callbacks=[
+            checkpoint_callback,
+            pl.callbacks.LambdaCallback(
+                on_load_checkpoint=lambda trainer, pl_module, checkpoint: save_scripted_generator(
+                    pl_module.G
+                )
+            ),
+        ],
         # callbacks=[
         #     pl.callbacks.LambdaCallback(
         #         on_train_epoch_end=lambda *args: trainer.save_checkpoint("last.ckpt")
@@ -255,7 +274,7 @@ def train(a, h, device):
         train_dataloaders=train_loader,
         val_dataloaders=validation_loader,
         # ckpt_path="checkpoints/cp-last-v5.ckpt",
-        ckpt_path="last"
+        ckpt_path="last",
     )
 
 
@@ -269,7 +288,7 @@ def main():
     parser.add_argument("--input_mels_dir", default="ft_dataset")
     parser.add_argument("--input_training_file", default="LJSpeech-1.1/training.txt")
     parser.add_argument("--input_validation_file", default="LJSpeech-1.1/validation.txt")
-    parser.add_argument("--checkpoint_path", default="cp_hifigan")
+    parser.add_argument("--checkpoint_path", default="checkpoints")
     parser.add_argument("--training_epochs", default=3100, type=int)
     parser.add_argument("--stdout_interval", default=5, type=int)
     parser.add_argument("--checkpoint_interval", default=5000, type=int)
