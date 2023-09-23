@@ -295,6 +295,7 @@ def main():
     parser.add_argument("--summary_interval", default=100, type=int)
     parser.add_argument("--validation_interval", default=1000, type=int)
     parser.add_argument("--fine_tuning", default=False, type=bool)
+    parser.add_argument("--batch_size", type=int)
 
     a = parser.parse_args()
 
@@ -303,6 +304,9 @@ def main():
 
     json_config = json.loads(data)
     h = AttrDict(json_config)
+    if a.batch_size:
+        h.batch_size = a.batch_size
+
     build_env(a.config, "config.json", a.checkpoint_path)
 
     torch.manual_seed(h.seed)
@@ -310,6 +314,7 @@ def main():
         device = "cuda"
 
         torch.cuda.manual_seed(h.seed)
+        torch.set_float32_matmul_precision('high')
         h.num_gpus = torch.cuda.device_count()
         h.batch_size = int(h.batch_size / h.num_gpus)
         print("Batch size per GPU :", h.batch_size)

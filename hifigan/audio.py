@@ -30,6 +30,7 @@ class AudioFrontend:
             f_min=self.config.fmin,
             f_max=self.config.fmax,
             norm="slaney",
+            mel_scale="slaney"
         )
         self.stft_to_mels = MelScale(
             n_mels=self.config.num_mels,
@@ -85,14 +86,14 @@ class AudioFrontend:
         D = self.spectrogram_db(wave) [:, :, 1:-1]
         M = self.stft_to_mels_db(D)
 
-        D_db = (amplitude_to_DB(D, 10, 1e-12, 0) + 120) / 120
-        M_db = (amplitude_to_DB(M, 10, 1e-12, 0) + 120) / 120
+        D_db = torch.clip((amplitude_to_DB(D, 10, 1e-12, 0) + 100) / 100, min=0)
+        M_db = torch.clip((amplitude_to_DB(M, 10, 1e-12, 0) + 100) / 100, min=0)
 
-        D_log = (D_db - 0.911) / 0.0724
-        M_log = (M_db - 0.911) / 0.0724
+        D_log = (D_db - 0.911) / 0.0869
+        M_log = (M_db - 0.911) / 0.0869
         return D_log, M_log
 
     def encode(self, wave):
-        # D, M = self.encode_log(wave)
+        # D_log, M_log = self.encode_log(wave)
         D_log, M_log = self.encode_db(wave)
         return D_log, M_log
